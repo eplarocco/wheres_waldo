@@ -1,0 +1,4 @@
+train: yolo_dataset/train  # Path to training data
+val: yolo_dataset/val      # Path to validation data
+nc: 1                      # Number of classes
+names: ["waldo"]           # Class names
