@@ -1,0 +1,174 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.ops import RoIAlign
+import torchvision.ops as ops
+
+device = device = torch.device("cuda")
+
+def decode_boxes(deltas, anchors):
+    """
+    Decode bounding box deltas to proposals.
+
+    Args:
+        deltas: [num_anchors, 4] Predicted bbox deltas (dx, dy, dw, dh).
+        anchors: [num_anchors, 4] Anchor boxes (x1, y1, x2, y2).
+
+    Returns:
+        decoded_boxes: [num_anchors, 4] Decoded boxes in (x1, y1, x2, y2) format.
+    """
+    # Convert anchors to center format (cx, cy, w, h)
+    anchors = ops.box_convert(anchors, in_fmt="xyxy", out_fmt="cxcywh")
+    anchor_cx, anchor_cy, anchor_w, anchor_h = anchors.split(1, dim=1)
+
+    # Decode deltas
+    dx, dy, dw, dh = deltas.split(1, dim=1)
+    pred_cx = dx * anchor_w + anchor_cx
+    pred_cy = dy * anchor_h + anchor_cy
+    pred_w = torch.exp(dw) * anchor_w
+    pred_h = torch.exp(dh) * anchor_h
+
+    # Convert back to (x1, y1, x2, y2)
+    decoded_boxes = torch.cat([
+        pred_cx - 0.5 * pred_w,  # x1
+        pred_cy - 0.5 * pred_h,  # y1
+        pred_cx + 0.5 * pred_w,  # x2
+        pred_cy + 0.5 * pred_h   # y2
+    ], dim=1)
+
+    return decoded_boxes
+
+
+def generate_anchors(base_size, scales, aspect_ratios, feature_size, stride, device):
+    """
+    Generate anchors for the feature map.
+
+    Args:
+        base_size (int): Base size of the anchors.
+        scales (list of float): Scaling factors for the anchors.
+        aspect_ratios (list of float): Aspect ratios (width/height) for the anchors.
+        feature_size (tuple of int): Feature map size (height, width).
+        stride (int): Stride of the feature map relative to the input image.
+
+    Returns:
+        anchors (torch.Tensor): [num_anchors, 4] Anchor boxes (x1, y1, x2, y2).
+    """
+    anchors = []
+    for y in range(feature_size[0]):
+        for x in range(feature_size[1]):
+            cx = x * stride + stride / 2  # Center x
+            cy = y * stride + stride / 2  # Center y
+            for scale in scales:
+                for ratio in aspect_ratios:
+                    w = base_size * scale * (ratio ** 0.5)
+                    h = base_size * scale / (ratio ** 0.5)
+                    anchors.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+    anchors = torch.tensor(anchors, dtype=torch.float32, device=device)
+    return anchors
+
+
+def generate_proposals(rpn_cls_logits, rpn_bbox_preds, anchors, image_size, device, top_n=1):
+    batch_size = rpn_cls_logits.size(0)
+    proposals = []
+
+    for b in range(batch_size):
+        # Flatten predictions and anchors
+        cls_logits = rpn_cls_logits[b].permute(1, 2, 0).reshape(-1, 2)
+        bbox_preds = rpn_bbox_preds[b].permute(1, 2, 0).reshape(-1, 4)
+        
+        # Apply softmax to classification logits
+        scores = F.softmax(cls_logits, dim=-1)[:, 1]  # Keep "objectness" score
+        
+        # Decode predicted deltas to proposals
+        decoded_boxes = decode_boxes(bbox_preds, anchors)
+        
+        # Clip proposals to image boundaries
+        decoded_boxes = ops.clip_boxes_to_image(decoded_boxes, image_size)
+        
+        # Filter proposals by score and apply NMS
+        keep = ops.nms(decoded_boxes, scores, iou_threshold=0.7)
+        keep = keep[:top_n]  # Keep top_n proposals (1 in this case)
+        
+        # Add batch index
+        batch_proposals = torch.cat(
+            [torch.full((len(keep), 1), b, dtype=torch.float32, device=decoded_boxes.device), 
+             decoded_boxes[keep]], 
+            dim=1
+        )
+        proposals.append(batch_proposals)
+
+    # Concatenate all proposals across batches
+    return torch.cat(proposals, dim=0)
+
+
+class SimpleRCNN(nn.Module):
+    def __init__(self, num_anchors=9):
+        super(SimpleRCNN, self).__init__()
+        
+        # Use pretrained ResNet50 as the backbone
+        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # Use layers up to the last conv layer
+        
+        # Freeze the initial layers to retain pretrained weights
+        for param in list(self.backbone.parameters())[:6]:
+            param.requires_grad = False
+
+        # Region Proposal Network (RPN)
+        self.rpn_conv = nn.Conv2d(2048, 512, kernel_size=3, padding=1)  # RPN Conv layer
+        self.rpn_cls = nn.Conv2d(512, num_anchors * 2, kernel_size=1)  # 2 class logits per anchor (object, no object)
+        self.rpn_reg = nn.Conv2d(512, num_anchors * 4, kernel_size=1)  # 4 bbox coords per anchor
+
+        # RoI Align (assumes a fixed feature map size of 7x7 for simplicity)
+        self.roi_align = RoIAlign((7, 7), spatial_scale=1.0 / 16, sampling_ratio=2)
+
+        # Fully connected layers for classification and regression
+        self.fc1 = nn.Linear(2048 * 7 * 7, 1024)
+        self.fc2 = nn.Linear(1024, 4)  # Output bbox coords (x, y, w, h)
+
+    def forward(self, x):
+        # Step 1: Extract features
+        features = self.backbone(x)
+
+        # Step 2: Generate RPN outputs
+        rpn_feat = F.relu(self.rpn_conv(features))
+        rpn_cls_logits = self.rpn_cls(rpn_feat)
+        rpn_bbox_preds = self.rpn_reg(rpn_feat)
+
+        # Step 3: Generate anchors
+        feature_size = (features.size(2), features.size(3))  # (height, width) of feature map
+        stride = 16  # Assuming input image is downsampled by 16x in the backbone
+        anchors = generate_anchors(base_size=16, scales=[1.0, 2.0, 0.5], aspect_ratios=[0.5, 1.0, 2.0],
+                                    feature_size=feature_size, stride=stride, device=x.device)
+
+        # Step 4: Generate proposals from RPN outputs
+        proposals = generate_proposals(rpn_cls_logits, rpn_bbox_preds, anchors, x.size()[2:], device=x.device, top_n=1)
+
+        # Step 5: Perform RoI Align
+        roi_features = self.roi_align(features, proposals)
+
+        # Step 6: Predict bounding boxes
+        roi_flattened = roi_features.view(roi_features.size(0), -1)
+        fc1_out = F.relu(self.fc1(roi_flattened))
+        bbox = self.fc2(fc1_out)
+
+        return bbox #, rpn_cls_logits, rpn_bbox_preds
+
+
+# Example usage:
+# Instantiate the model
+model = SimpleRCNN()
+
+# Example input image tensor (batch_size=1, channels=3, height=512, width=512)
+input_tensor = torch.randn(1, 3, 512, 512)
+
+# Move inputs to the same device as the model
+#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+input_tensor = input_tensor.to(device)
+
+# Forward pass
+bbox = model(input_tensor)
+
+print("BBox Refinements:", bbox.shape)
+print(bbox)
